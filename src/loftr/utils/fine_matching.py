@@ -4,9 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from kornia.geometry.subpix import dsnt
-from kornia.utils.grid import create_meshgrid
-
-from loguru import logger
+from kornia.geometry.grid import create_meshgrid
 
 class FineMatching(nn.Module):
     """FineMatching with s2d paradigm"""
@@ -31,48 +29,34 @@ class FineMatching(nn.Module):
                 'mkpts0_f' (torch.Tensor): [M, 2],
                 'mkpts1_f' (torch.Tensor): [M, 2]}
         """
-        M, WW, C = feat_0.shape
-        W = int(math.sqrt(WW))
+        M, _, C = feat_0.shape
+        W = int(self.config['fine_window_size'])
+        WW = int(W**2)
+
         scale = data['hw0_i'][0] / data['hw0_f'][0]
         self.M, self.W, self.WW, self.C, self.scale = M, W, WW, C, scale
 
-        # corner case: if no coarse matches found
-        if M == 0:
-            assert self.training == False, "M is always > 0 while training, see coarse_matching.py"
-            data.update({
-                'conf_matrix_f': torch.empty(0, WW, WW, device=feat_0.device),
-                'mkpts0_f': data['mkpts0_c'],
-                'mkpts1_f': data['mkpts1_c'],
-            })
-            return
-
         # compute pixel-level confidence matrix
-        with torch.autocast(enabled=True if not (self.training or self.validate) else False, device_type='cuda'):
-            feat_f0, feat_f1 = feat_0[...,:-self.local_regress_slicedim], feat_1[...,:-self.local_regress_slicedim]
-            feat_ff0, feat_ff1 = feat_0[...,-self.local_regress_slicedim:], feat_1[...,-self.local_regress_slicedim:]
-            feat_f0, feat_f1 = feat_f0 / C**.5, feat_f1 / C**.5
-            conf_matrix_f = torch.einsum('mlc,mrc->mlr', feat_f0, feat_f1)
-            conf_matrix_ff = torch.einsum('mlc,mrc->mlr', feat_ff0, feat_ff1 / (self.local_regress_slicedim)**.5)
+        feat_f0, feat_f1 = feat_0[...,:-self.local_regress_slicedim], feat_1[...,:-self.local_regress_slicedim]
+        feat_ff0, feat_ff1 = feat_0[...,-self.local_regress_slicedim:], feat_1[...,-self.local_regress_slicedim:]
+        feat_f0, feat_f1 = feat_f0 / C**.5, feat_f1 / C**.5
+        
+        conf_matrix_f = torch.einsum('mlc,mrc->mlr', feat_f0, feat_f1)
+        conf_matrix_ff = torch.einsum('mlc,mrc->mlr', feat_ff0, feat_ff1 / (self.local_regress_slicedim)**.5)
 
         softmax_matrix_f = F.softmax(conf_matrix_f, 1) * F.softmax(conf_matrix_f, 2)
         softmax_matrix_f = softmax_matrix_f.reshape(M, self.WW, self.W+2, self.W+2)
-        softmax_matrix_f = softmax_matrix_f[...,1:-1,1:-1].reshape(M, self.WW, self.WW)
-
-        # for fine-level supervision
-        if self.training or self.validate:
-            data.update({'sim_matrix_ff': conf_matrix_ff})
-            data.update({'conf_matrix_f': softmax_matrix_f})
+        softmax_matrix_f = softmax_matrix_f[...,1:-1,1:-1].contiguous().view(M, self.WW, self.WW)
 
         # compute pixel-level absolute kpt coords
         self.get_fine_ds_match(softmax_matrix_f, data)
 
         # generate seconde-stage 3x3 grid
         idx_l, idx_r = data['idx_l'], data['idx_r']
-        m_ids = torch.arange(M, device=idx_l.device, dtype=torch.long).unsqueeze(-1)
-        m_ids = m_ids[:len(data['mconf'])]
-        idx_r_iids, idx_r_jids = idx_r // W, idx_r % W
+        m_ids = torch.arange(M, device=idx_l.device, dtype=torch.long)
+        idx_r_iids, idx_r_jids = torch.div(idx_r, W, rounding_mode="trunc"), idx_r % W
 
-        m_ids, idx_l, idx_r_iids, idx_r_jids = m_ids.reshape(-1), idx_l.reshape(-1), idx_r_iids.reshape(-1), idx_r_jids.reshape(-1)
+        m_ids, idx_l, idx_r_iids, idx_r_jids = m_ids.view(-1), idx_l.view(-1), idx_r_iids.view(-1), idx_r_jids.view(-1)
         delta = create_meshgrid(3, 3, True, conf_matrix_ff.device).to(torch.long) # [1, 3, 3, 2]
 
         m_ids = m_ids[...,None,None].expand(-1, 3, 3)
@@ -81,28 +65,23 @@ class FineMatching(nn.Module):
         idx_r_iids = idx_r_iids[...,None,None].expand(-1, 3, 3) + delta[None, ..., 1]
         idx_r_jids = idx_r_jids[...,None,None].expand(-1, 3, 3) + delta[None, ..., 0]
 
-        if idx_l.numel() == 0:
-            data.update({
-                'mkpts0_f': data['mkpts0_c'],
-                'mkpts1_f': data['mkpts1_c'],
-            })
-            return
-
         # compute second-stage heatmap
-        conf_matrix_ff = conf_matrix_ff.reshape(M, self.WW, self.W+2, self.W+2)
-        conf_matrix_ff = conf_matrix_ff[m_ids, idx_l, idx_r_iids, idx_r_jids]
-        conf_matrix_ff = conf_matrix_ff.reshape(-1, 9)
-        conf_matrix_ff = F.softmax(conf_matrix_ff / self.local_regress_temperature, -1)
-        heatmap = conf_matrix_ff.reshape(-1, 3, 3)
+        conf_matrix_ff = conf_matrix_ff.view(-1, self.WW, self.W+2, self.W+2)
+
+        # Flatten multi-dimensional gather for ONNX compatibility
+        flat_indices = (m_ids * WW * (W+2) * (W+2)) + (idx_l * (W+2) * (W+2)) + (idx_r_iids * (W+2)) + idx_r_jids
+        conf_matrix_ff = conf_matrix_ff.view(-1)
+        conf_matrix_ff = conf_matrix_ff[flat_indices.view(-1)]
+        
+        conf_matrix_ff = conf_matrix_ff.view(-1, 9)
+        conf_matrix_ff = F.softmax(conf_matrix_ff / self.local_regress_temperature, dim=-1)
+        heatmap = conf_matrix_ff.view(-1, 3, 3)
 
         # compute coordinates from heatmap
         coords_normalized = dsnt.spatial_expectation2d(heatmap[None], True)[0]
 
-        if data['bs'] == 1:
-            scale1 = scale * data['scale1'] if 'scale0' in data else scale
-        else:
-            scale1 = scale * data['scale1'][data['b_ids']][:len(data['mconf']), ...][:,None,:].expand(-1, -1, 2).reshape(-1, 2) if 'scale0' in data else scale
-
+        scale1 = data.get('scale1', torch.ones((), device=feat_0.device))
+        scale1 = scale * scale1
         # compute subpixel-level absolute kpt coords
         self.get_fine_match_local(coords_normalized, data, scale1)
 
@@ -113,7 +92,7 @@ class FineMatching(nn.Module):
 
         # mkpts0_f and mkpts1_f
         mkpts0_f = mkpts0_c
-        mkpts1_f = mkpts1_c + (coords_normed * (3 // 2) * scale1)
+        mkpts1_f = mkpts1_c + (coords_normed * (3.0 / 2.0) * scale1)
 
         data.update({
             "mkpts0_f": mkpts0_f,
@@ -122,35 +101,30 @@ class FineMatching(nn.Module):
 
     @torch.no_grad()
     def get_fine_ds_match(self, conf_matrix, data):
-        W, WW, C, scale = self.W, self.WW, self.C, self.scale
-        m, _, _ = conf_matrix.shape
+        M = conf_matrix.shape[0]
 
-        conf_matrix = conf_matrix.reshape(m, -1)[:len(data['mconf']),...]
+        conf_matrix = conf_matrix.view(M, -1)
         val, idx = torch.max(conf_matrix, dim = -1)
-        idx = idx[:,None]
-        idx_l, idx_r = idx // WW, idx % WW
+        idx = idx.view(-1, 1)
+
+        idx_l, idx_r = torch.div(idx, self.WW, rounding_mode="trunc"), idx % self.WW
 
         data.update({'idx_l': idx_l, 'idx_r': idx_r})
 
-        if self.fp16:
-            grid = create_meshgrid(W, W, False, conf_matrix.device, dtype=torch.float16) - W // 2 + 0.5 # kornia >= 0.5.1
-        else:
-            grid = create_meshgrid(W, W, False, conf_matrix.device) - W // 2 + 0.5
-        grid = grid.reshape(1, -1, 2).expand(m, -1, -1)
+        grid = create_meshgrid(self.W, self.W, False, conf_matrix.device, dtype=conf_matrix.dtype) - self.W // 2 + 0.5 # kornia >= 0.5.1
+        grid = grid.reshape(1, -1, 2).expand(M, -1, -1)
+
         delta_l = torch.gather(grid, 1, idx_l.unsqueeze(-1).expand(-1, -1, 2))
         delta_r = torch.gather(grid, 1, idx_r.unsqueeze(-1).expand(-1, -1, 2))
 
-        scale0 = scale * data['scale0'][data['b_ids']] if 'scale0' in data else scale
-        scale1 = scale * data['scale1'][data['b_ids']] if 'scale0' in data else scale
+        scale0 = data.get('scale0', torch.ones((), device=conf_matrix.device))
+        scale1 = data.get('scale1', torch.ones((), device=conf_matrix.device))
 
-        if torch.is_tensor(scale0) and scale0.numel() > 1: # scale0 is a tensor
-            mkpts0_f = (data['mkpts0_c'][:,None,:] + (delta_l * scale0[:len(data['mconf']),...][:,None,:])).reshape(-1, 2)
-            mkpts1_f = (data['mkpts1_c'][:,None,:] + (delta_r * scale1[:len(data['mconf']),...][:,None,:])).reshape(-1, 2)
-        else: # scale0 is a float
-            mkpts0_f = (data['mkpts0_c'][:,None,:] + (delta_l * scale0)).reshape(-1, 2)
-            mkpts1_f = (data['mkpts1_c'][:,None,:] + (delta_r * scale1)).reshape(-1, 2)
+        mkpts0_f = (data['mkpts0_c'][:,None,:] + (delta_l * scale0 * self.scale)).view(-1, 2)
+        mkpts1_f = (data['mkpts1_c'][:,None,:] + (delta_r * scale1 * self.scale)).view(-1, 2)
         
         data.update({
             "mkpts0_c": mkpts0_f,
             "mkpts1_c": mkpts1_f
         })
+
