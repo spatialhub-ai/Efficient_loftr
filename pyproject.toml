@@ -1,0 +1,25 @@
+[project]
+name = "efficientloftr"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "einops>=0.8.2",
+    "joblib>=1.5.3",
+    "kornia>=0.8.2",
+    "loguru>=0.7.3",
+    "matplotlib>=3.10.9",
+    "onnx>=1.22.0",
+    "opencv-python>=5.0.0.93",
+    "pillow>=12.2.0",
+    "pytorch-lightning>=2.6.5",
+    "torch==2.6.0",
+    "torchmetrics>=1.0.3",
+    "tqdm>=4.66.5",
+    "yacs>=0.1.8",
+]
+
+[[tool.uv.index]]
+url = "https://download.pytorch.org/whl/cu118"
+
