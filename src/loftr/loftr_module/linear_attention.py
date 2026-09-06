@@ -57,9 +57,7 @@ class Attention(Module):
             out = torch.einsum("nlsh,nshd->nlhd", A, value)
         return out
 
-    def _forward(self, query, key, value, q_mask=None, kv_mask=None):
-        if q_mask is not None:
-            query, key, value, mask_h0, mask_w0 = crop_feature(query, key, value, q_mask, kv_mask)
+    def _forward(self, query, key, value):
 
         if self.flash:
             query, key, value = map(lambda x: rearrange(x, 'n h w (nhead d) -> n nhead (h w) d', nhead=self.nhead, d=self.dim), [query, key, value])
@@ -70,13 +68,10 @@ class Attention(Module):
 
         if self.flash:
             m = rearrange(m, 'n nhead L d -> n L nhead d', nhead=self.nhead, d=self.dim)
-
-        if q_mask is not None:
-            m = pad_feature(m, mask_h0, mask_w0, q_mask)
         
         return m
     
-    def forward(self, query, key, value, q_mask=None, kv_mask=None):
+    def forward(self, query, key, value):
         """ Multi-head scaled dot-product attention, a.k.a full attention.
         Args:
             if FLASH_AVAILABLE: # pytorch scaled_dot_product_attention
@@ -92,12 +87,5 @@ class Attention(Module):
         Returns:
             queried_values: (N, L, H, D)
         """
-        bs = query.size(0)
-        if bs == 1 or q_mask is None:            
-            m = self._forward(query, key, value, q_mask=q_mask, kv_mask=kv_mask)
-        else: # for faster trainning with padding mask while batch size > 1
-            m_list = []
-            for i in range(bs):
-                m_list.append(self._forward(query[i:i+1], key[i:i+1], value[i:i+1], q_mask=q_mask[i:i+1], kv_mask=kv_mask[i:i+1]))
-            m = torch.cat(m_list, dim=0)
-        return m
+    
+        return self._forward(query, key, value)
